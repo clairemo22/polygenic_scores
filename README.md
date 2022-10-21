@@ -7,3 +7,5 @@ Here, we used a subset of UK Biobank (UKB) data for the discovery sample GWAS an
 We used a "densely phenotyped" sample to predict a "sparsely phenotyped" sample and vice versa.
 
 The phenotype of interest was a factor score of Common Executive Function. 
+
+The PGS' were computed using R, Plink and GCTA. 
