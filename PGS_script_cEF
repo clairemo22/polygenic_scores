@@ -1,0 +1,417 @@
+# create PRS for dense and sparse EF respectively, predict EF and IQ
+
+# QC both target and ref samples
+```{r}
+
+### target sample QC (chroms are split -- put through a loop)
+
+#!/bin/bash
+#SBATCH -J target-sample-QC
+#SBATCH --partition=shas
+#SBATCH --ntasks=15
+#SBATCH --array=1-22
+#SBATCH --time=24:00:00
+
+### set variable that will be the number of the SNP set
+cc="${SLURM_ARRAY_TASK_ID}"
+
+plink --bfile /pl/active/IBG/UKBiobank/GENO/QCed/imputed/white/ukb_imputed_QC/chrom/plink_bed/chr.$cc.qc --geno 0.1 --mind 0.1 --maf 0.01 --hwe 0.001 --make-bed --out ukb_geno.$cc
+
+
+grep error {logfile prefix*}
+
+
+### reference sample QC
+
+#!/bin/bash
+#SBATCH -J ref-sample-QC
+#SBATCH --partition=shas
+#SBATCH --ntasks=15
+
+plink --bfile g1000_eur --geno 0.1 --mind 0.1 --maf 0.01 --hwe 0.001 --make-bed --out 1kg_cleaned
+
+grep error {logfile prefix*}
+
+
+# split ref file by chr
+# keep file fully together to get num SNPs in common with ref files (below), but run GCTA on split file for efficiency
+seq 22 | xargs -i -P 1 sh -c "plink --bfile 1kg_cleaned --make-bed --out 1kgsplit/1kg_cleaned.{}"
+
+```
+
+# dense weight calc then application
+```{r}
+
+### 1) dense sumstats computing dense PRS in sparse sample, dense N = 93,024
+
+# find number of SNPs in common with summary stats and LD reference
+
+# in R
+
+library(data.table)
+thousG <- fread("1kg_cleaned.bim")      
+nrow(thousG)
+sum.stats <- fread("/pl/active/friedman/studies/ukb/data/BoltFiles/Online/OnlineEFImpute.bgen.stats.gz", header=T, data.table=F)   ### these were reading in with warnings, and only reading 11 chromosomes. alex says it might be because i was sharing a node that ran out of memory.... it was some error with the node, resolved
+nrow(sum.stats)
+sumstats_in_kg <- subset(thousG, V2 %in% sum.stats$SNP)
+kg_in_sumstats <- subset(sum.stats, SNP %in% thousG$V2) #these should match = 7148890 SNPs
+
+### need to format this as SNP, A1, A2, MAF, beta, se, p, N IN THAT ORDER BEFORE SAVING
+
+kg_in_sumstats$N<- rep(93024, 1, nrow(kg_in_sumstats))
+kg_in_sumstats<- kg_in_sumstats[,c(1,5:7,11:12,14:15)]
+
+fwrite(kg_in_sumstats, "dense_sumstats_in_1kg_cleaned.txt", row.names=FALSE, col.names=FALSE, quote=FALSE, sep=" ") 
+
+# calc lambda
+m<- 7148890
+h2<- .201
+m*((1/h2)-1)
+
+
+# split sumstats by chr (need to merge CHR back in)
+
+library(data.table)
+ef<- fread("dense_sumstats_in_1kg_cleaned.txt", header=F, data.table=F)
+all<- fread("/pl/active/friedman/studies/ukb/data/BoltFiles/Online/OnlineEFImpute.bgen.stats.gz", header=T, data.table=F, fill=T) 
+withchr<- merge(all,ef,by.x="SNP",by.y="V1", all.y=T)
+withchr<- withchr[,c(1,2,15:ncol(withchr))]
+
+
+chrs<- seq(1,22,1)
+split<- list()
+for (i in 1:length(chrs)) {
+	split[[i]]<- subset(withchr, withchr$CHR==i)
+	split[[i]]$CHR<- NULL
+	fwrite(split[[i]], paste0("densesplit/dense_sum",i,".txt"), row.names=FALSE, col.names=FALSE, quote=FALSE, sep=" ")
+}
+
+
+### run SBLUP in GCTA
+# cojo sblup = lambda = 28417727
+
+#!/bin/bash
+#SBATCH -J dense-sblup
+#SBATCH --partition=shas
+#SBATCH --ntasks=15
+#SBATCH --array=1-22
+#SBATCH --time=24:00:00
+#SBATCH --mem=100gb
+
+### set variable that will be the number of the SNP set
+cc="${SLURM_ARRAY_TASK_ID}"
+
+
+gcta64 --bfile 1kgsplit/1kg_cleaned.$cc --cojo-file densesplit/dense_sum$cc.txt --cojo-sblup 28417727 --cojo-wind 1000 --thread-num 20 --out denseSBLUPout/dense_sblup_1kg_$cc
+
+
+### merge all 22 chromosomes
+library(data.table)
+chrs<- seq(1,22,1)
+d<- data.frame()
+for (i in 1:length(chrs)) {
+	chr <- fread(paste0("denseSBLUPout/dense_sblup_1kg_",i,".sblup.cojo"))
+	d<- rbind(d, chr)
+	fwrite(d, "dense.sblup.cojo", row.names=FALSE, col.names=FALSE, quote=FALSE, sep=" ")
+}
+
+
+### get columns we want 
+## Columns: Variant ID, Allele 1, effect size in the original GWAS summary data, and BLUP estimate of the SNP effect (LD-adjusted affect size)
+
+# in R
+
+library(data.table)
+sblup <- fread("dense.sblup.cojo")
+score <- sblup[,c(1,2,4)]
+fwrite(score, "dense_score_input_sblup_weights.txt", sep=" ", col.names=FALSE, row.names=FALSE, quote=FALSE)
+
+#### get only those in UKB who were in dense GWAS
+# /pl/active/friedman/studies/ukb/data/BoltFiles/OfflineEFNoRelated.txt has FIDs for sparse
+
+# /pl/active/friedman/studies/claire_ldsc_gsem/ukbsplit/ has UKB plink files
+
+library(data.table)
+s<- fread("/pl/active/friedman/studies/ukb/data/BoltFiles/OfflineEFNoRelated.txt")
+s<- s[,c(1:2)]
+fwrite(s, "/scratch/summit/clmo1617/cEF_PRS/sparse_IDs.txt",sep=" ", col.names=FALSE, row.names=FALSE, quote=FALSE)
+
+seq 22 | xargs -i -P 1 sh -c "plink --bfile /pl/active/friedman/studies/claire_ldsc_gsem/ukbsplit/ukb_geno.{} --keep sparse_IDs.txt --make-bed --out ukbsparsesplit/ukb.sparse.{}"
+
+
+### merge chromosomes together
+
+# from command line
+
+for i in {1..22}
+do
+echo ukb.sparse.$i.bed ukb.sparse.$i.bim ukb.sparse.$i.fam >> sparselist.txt
+done
+
+plink --allow-no-sex --bfile ukb.sparse.1 --merge-list sparselist.txt --make-bed --out ukbsparse
+
+### create PRS in plink
+### for DENSE sum stats, the cleaned_target sample needs to be those in the SPARSE set only
+### DO not want to do this chrom by chome
+### this is the DENSE sum stats predicting in the SPARSE sample
+
+#!/bin/bash
+#SBATCH -J dense-PRS
+#SBATCH --partition=shas
+#SBATCH --ntasks=15
+#SBATCH --time=24:00:00
+#SBATCH --mem=100gb
+
+
+plink --bfile ukbsparse --allow-no-sex --score dense_score_input_sblup_weights.txt --out PRS_dense/sblup_score_dense
+
+### calc sparse unreelateds
+
+#!/bin/bash
+#BATCH -J dense_rels
+#SBATCH --partition=shas
+#SBATCH --ntasks=15
+
+gcta64 --grm /pl/active/IBG/UKBiobank/exclusions/relatedness/white/eur --keep sparse_IDs.txt --grm-singleton 0.05 --threads 30 --out sparsesingletons 
+
+```
+
+# predict EF, IQ from dense PRS in sparse sample
+
+# /pl/active/friedman/studies/ukb/data/BoltFiles/BoltCovariates.txt
+# /pl/active/friedman/studies/ukb/data/BoltFiles/OfflineEFNoRelated.txt has IDs and EFFs
+
+```{r}
+## in R 
+covs<- fread("BoltCovariates.txt", header=T, data.table=F)
+covs$sex_1_male<- ifelse(covs$sex=="M", 1, 0)
+sparse<- fread("OfflineEFNoRelated.txt", header=T, data.table=F)
+sparse_covs<- merge(sparse, covs, by=c("IID", "FID"), all.x=T)
+s_ids<- fread("/scratch/summit/clmo1617/cEF_PRS/sparsesingletons.singleton.txt", header=F, data.table=F)
+colnames(s_ids)[1:2]<- c("IID", "FID")
+sparseF<- merge(s_ids, sparse_covs, by=c("IID", "FID"), all.x=T)
+
+denseweights<- fread("/scratch/summit/clmo1617/cEF_PRS/PRS_dense/sblup_score_dense.profile", header=T, data.table=F)
+sparseF2<- merge(sparseF, denseweights, by=c("IID", "FID"), all.x=T)
+
+IQ<- fread("GWASEFs.txt", header=T, data.table=F)
+IQ<- IQ[,c(1:2, 6)]
+sparseF3<- merge(sparseF2, IQ, by=c("IID", "FID"), all.x=T)
+
+colnames(sparseF3)[35]<- 'densePRS'
+
+sparseF3$densePRS_std<- sparseF3$densePRS/sd(sparseF3$densePRS, na.rm=T)
+
+fwrite(sparseF3, "/scratch/summit/clmo1617/cEF_PRS/sparse_sample_densePRS.txt", sep='\t')
+
+
+s$EFFS_std<- s$EFFS/sd(s$EFFS, na.rm=T)
+s$IQFS_std<- s$IQFS/sd(s$IQFS, na.rm=T)
+
+fwrite(s, "/scratch/summit/clmo1617/cEF_PRS/sparse_sample_densePRS.txt", sep='\t')
+
+
+sparseEF <- lm(EFFS_std ~  densePRS_std + WPC1 + WPC2 + WPC3 + WPC4+ WPC5+ WPC6 + WPC7 + WPC8 + WPC9 + WPC10 + EPC1 + EPC2 + EPC3 + EPC4+ EPC5+ EPC6 + EPC7 + EPC8 + EPC9 + EPC10 + sex_1_male + age + age2 + as.factor(batch) + as.factor(centre), data=s)
+
+summary(sparseEF)
+
+
+sparseIQ <- lm(IQFS_std ~  densePRS_std + WPC1 + WPC2 + WPC3 + WPC4+ WPC5+ WPC6 + WPC7 + WPC8 + WPC9 + WPC10 + EPC1 + EPC2 + EPC3 + EPC4+ EPC5+ EPC6 + EPC7 + EPC8 + EPC9 + EPC10 + sex_1_male + age + age2 + as.factor(batch) + as.factor(centre), data=s)
+
+summary(sparseIQ)
+
+
+```
+
+
+
+# sparse weight calc then application
+```{r}
+
+### 2) sparse sumstats computing dense PRS in dense sample, sparse N = 256,135
+
+# find number of SNPs in common with summary stats and LD reference
+# in R
+
+library(data.table)
+thousG <- fread("1kg_cleaned.bim")      
+nrow(thousG)
+sum.stats <- fread("/pl/active/friedman/studies/ukb/data/BoltFiles/OfflineNoR/OfflineEFNoR.bgen.stats.gz", header=T, data.table=F)   
+nrow(sum.stats)
+sumstats_in_kg <- subset(thousG, V2 %in% sum.stats$SNP)
+kg_in_sumstats <- subset(sum.stats, SNP %in% thousG$V2) #these should match = 7148890 SNPs
+
+kg_in_sumstats$N<- rep(256135, 1, nrow(kg_in_sumstats))
+
+kg_in_sumstats<- kg_in_sumstats[,c(1,5:7,11:12,14:15)]
+
+### need to format this as SNP, A1, A2, MAF***, beta, se, p, N IN THAT ORDER BEFORE SAVING
+fwrite(kg_in_sumstats, "sparse_sumstats_in_1kg_cleaned.txt", row.names=FALSE, col.names=FALSE, quote=FALSE, sep=" ") 
+
+# calc lambda 
+m<- 7148890
+h2<- .081
+m*((1/h2)-1)
+
+
+# split sumstats by chr (need to merge CHR back in)
+
+library(data.table)
+ef<- fread("sparse_sumstats_in_1kg_cleaned.txt", header=F, data.table=F)
+all<- fread("/pl/active/friedman/studies/ukb/data/BoltFiles/OfflineNoR/OfflineEFNoR.bgen.stats.gz", header=T, data.table=F, fill=T) 
+withchr<- merge(all,ef,by.x="SNP",by.y="V1", all.y=T)
+withchr<- withchr[,c(1,2,15:ncol(withchr))]
+
+
+chrs<- seq(1,22,1)
+split<- list()
+for (i in 1:length(chrs)) {
+	split[[i]]<- subset(withchr, withchr$CHR==i)
+	split[[i]]$CHR<- NULL
+	fwrite(split[[i]], paste0("sparsesplit/sparse_sum",i,".txt"), row.names=FALSE, col.names=FALSE, quote=FALSE, sep=" ")
+}
+
+
+### run SBLUP in GCTA
+# cojo sblup = lambda = 81109011
+
+#!/bin/bash
+#SBATCH -J sparse-sblub
+#SBATCH --partition=shas
+#SBATCH --ntasks=15
+#SBATCH --array=1-22
+#SBATCH --time=24:00:00
+#SBATCH --mem=100gb
+
+### set variable that will be the number of the SNP set
+cc="${SLURM_ARRAY_TASK_ID}"
+
+
+gcta64 --bfile 1kgsplit/1kg_cleaned.$cc --cojo-file sparsesplit/sparse_sum$cc.txt --cojo-sblup 81109011 --cojo-wind 1000 --thread-num 30 --out sparseSBLUPout/sparse_sblup_1kg_$cc
+
+### merge all 22 chromosomes
+library(data.table)
+chrs<- seq(1,22,1)
+s<- data.frame()
+for (i in 1:length(chrs)) {
+	chr <- fread(paste0("sparseSBLUPout/sparse_sblup_1kg_",i,".sblup.cojo"))
+	s<- rbind(d, chr)
+	fwrite(s, "sparse.sblup.cojo", row.names=FALSE, col.names=FALSE, quote=FALSE, sep=" ")
+}
+
+
+### get columns we want 
+# Columns: Variant ID, Allele 1, effect size in the original GWAS summary data, and BLUP estimate of the SNP effect (LD-adjusted affect size)
+
+library(data.table)
+sblup <- fread("sparse.sblup.cojo")
+score <- sblup[,c(1,2,4)]
+fwrite(score, "sparse_score_input_sblup_weights.txt", sep=" ", col.names=FALSE, row.names=FALSE, quote=FALSE)
+
+#### get only those in UKB who were in dense GWAS
+# /pl/active/friedman/studies/ukb/data/BoltFiles/OnlineEF.txt has FIDs for dense
+
+# /pl/active/friedman/studies/claire_ldsc_gsem/ukbsplit/ has UKB plink files
+
+library(data.table)
+d<- fread("/pl/active/friedman/studies/ukb/data/BoltFiles/OnlineEF.txt")
+d<- d[,c(1:2)]
+fwrite(d, "/scratch/summit/clmo1617/cEF_PRS/dense_IDs.txt",sep=" ", col.names=FALSE, row.names=FALSE, quote=FALSE)
+
+
+### need to re do this! Need to get rid of relateds 
+seq 22 | xargs -i -P 1 sh -c "plink --bfile /pl/active/friedman/studies/claire_ldsc_gsem/ukbsplit/ukb_geno.{} --keep densesingletons.singleton.txt --make-bed --out ukbdensesplit_SINGLETONS/ukb.dense.{}"
+
+### merge chromosomes together
+
+# from commmand line
+
+for i in {1..22}
+do
+echo ukb.dense.$i.bed ukb.dense.$i.bim ukb.dense.$i.fam >> denselist.txt
+done
+
+
+plink --allow-no-sex --bfile ukb.dense.1 --merge-list denselist.txt --make-bed --out ukbdense_SINGLE
+
+
+### create PRS in plink
+### for SPARSE sum stats, the cleaned_target sample needs to be those in the DENSE set only
+### DO NOT want to do this chrom by chrom
+### this is sparse PRS predicting in dense
+
+#!/bin/bash
+#SBATCH -J dense-PRS
+#SBATCH --partition=shas
+#SBATCH --ntasks=15
+#SBATCH --array=1-22
+#SBATCH --time=24:00:00
+#SBATCH --mem=100gb
+
+### set variable that will be the number of the SNP set
+cc="${SLURM_ARRAY_TASK_ID}"
+
+
+#### re do!!!! to get dense singeltons
+plink --bfile ukbdense_SINGLE --allow-no-sex --score sparse_score_input_sblup_weights.txt  --out PRS_sparse/sblup_score_sparse
+
+### calc relateds more than .05
+
+#!/bin/bash
+#BATCH -J dense_rels
+#SBATCH --partition=shas
+#SBATCH --ntasks=15
+
+gcta64 --grm /pl/active/IBG/UKBiobank/exclusions/relatedness/white/eur --keep dense_IDs.txt --grm-singleton 0.05 --threads 30 --out densesingletons 
+
+
+
+```
+
+# predict EF, IQ from sparse PRS in dense sample
+
+# /pl/active/friedman/studies/ukb/data/BoltFiles/BoltCovariates.txt
+# /pl/active/friedman/studies/ukb/data/BoltFiles/OnlineEF.txt
+
+```{r}
+
+# in R
+
+covs<- fread("BoltCovariates.txt", header=T, data.table=F)
+covs$sex_1_male<- ifelse(covs$sex=="M", 1, 0)
+dense<- fread("OnlineEF.txt", header=T, data.table=F)
+dense_covs<- merge(dense, covs, by=c("IID", "FID"), all.x=T)
+d_ids<- fread("/scratch/summit/clmo1617/cEF_PRS/densesingletons.singleton.txt", header=F, data.table=F)
+colnames(d_ids)[1:2]<- c("IID", "FID")
+denseF<- merge(d_ids, dense_covs, by=c("IID", "FID"), all.x=T)
+
+sparseweights<- fread("/scratch/summit/clmo1617/cEF_PRS/PRS_sparse/sblup_score_sparse.profile", header=T, data.table=F)
+denseF2<- merge(denseF, sparseweights, by=c("IID", "FID"), all.x=T)
+
+IQ<- fread("GWASEFs.txt", header=T, data.table=F)
+IQ<- IQ[,c(1:2, 6)]
+denseF3<- merge(denseF2, IQ, by=c("IID", "FID"), all.x=T)
+
+colnames(denseF3)[35]<- 'sparsePRS'
+
+denseF3$sparsePRS_std<- denseF3$sparsePRS/sd(denseF3$sparsePRS, na.rm=T)
+
+fwrite(denseF3, "/scratch/summit/clmo1617/cEF_PRS/dense_sample_sparsePRS.txt", sep='\t')
+
+
+d$EFFS_std<- d$EFFS/sd(d$EFFS, na.rm=T)
+d$IQFS_std<- d$IQFS/sd(d$IQFS, na.rm=T)
+
+fwrite(d, "/scratch/summit/clmo1617/cEF_PRS/dense_sample_sparsePRS.txt", sep='\t')
+
+
+
+denseEF <- lm(EFFS_std~  sparsePRS_std + WPC1 + WPC2 + WPC3 + WPC4+ WPC5+ WPC6 + WPC7 + WPC8 + WPC9 + WPC10 + EPC1 + EPC2 + EPC3 + EPC4+ EPC5+ EPC6 + EPC7 + EPC8 + EPC9 + EPC10 + sex_1_male + age + age2 + batch.factor + centre.factor, data=d)
+
+summary(denseEF)
+
+
+denseIQ <- lm(IQFS_std ~  sparsePRS_std + WPC1 + WPC2 + WPC3 + WPC4+ WPC5+ WPC6 + WPC7 + WPC8 + WPC9 + WPC10 + EPC1 + EPC2 + EPC3 + EPC4+ EPC5+ EPC6 + EPC7 + EPC8 + EPC9 + EPC10 + sex_1_male + age + age2 + batch.factor + centre.factor, data=d)
+
+summary(denseIQ)
+```
